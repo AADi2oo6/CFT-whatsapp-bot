@@ -18,7 +18,8 @@ const {
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+// UPDATED MODEL as requested by user
+const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 
 // Route 1: Health Check
 app.get('/', (req, res) => {
@@ -45,10 +46,11 @@ app.get('/webhook', (req, res) => {
 
 // Route 3: Handle Incoming Messages
 app.post('/webhook', async (req, res) => {
+  // 1. Detailed Logging: Log exact payload from Meta
+  console.log('Incoming Webhook Body:', JSON.stringify(req.body, null, 2));
+
   try {
     const body = req.body;
-
-    console.log('Webhook Received');
 
     if (body.object) {
       if (
@@ -58,10 +60,35 @@ app.post('/webhook', async (req, res) => {
         body.entry[0].changes[0].value.messages[0]
       ) {
         const message = body.entry[0].changes[0].value.messages[0];
-        const sender = message.from;
         const type = message.type;
+        const from = message.from;
+        const messageId = message.id;
 
         console.log(`Message Type Detected: [${type}]`);
+
+        // --- REPLY TO USER ---
+        try {
+          await axios.post(
+            `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
+            {
+              messaging_product: "whatsapp",
+              to: from,
+              text: { body: "🤖 I received your message! Analysis starting..." },
+              context: { message_id: messageId }
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+                "Content-Type": "application/json"
+              }
+            }
+          );
+          console.log("Reply sent successfully.");
+        } catch (replyError) {
+          console.error("Failed to send reply:", replyError.message);
+          if (replyError.response) console.error("Reply Error Details:", JSON.stringify(replyError.response.data, null, 2));
+        }
+        // ---------------------
 
         let geminiInputParts = [];
 
@@ -101,19 +128,19 @@ app.post('/webhook', async (req, res) => {
             });
           } catch (mediaError) {
             console.error("Error downloading media:", mediaError.message);
-            // Continue logging but maybe without media content
+            if (mediaError.response) console.error('Media Download Error Details:', JSON.stringify(mediaError.response.data, null, 2));
             geminiInputParts.push("Error downloading media. Analyze what you have.");
           }
         } else {
           console.log(`Unsupported message type: ${type}`);
-          return res.sendStatus(200);
+          // Do not return here, let it fall through to send 200 properly
         }
 
         // Gemini Analysis
-        console.log('Sending to Gemini for analysis...');
-        const prompt = "You are a data extractor. Analyze the input and return ONLY a valid JSON object with keys: 'summary' (string), 'intent' (string), and 'details' (object). Do not use Markdown formatting.";
+        if (geminiInputParts.length > 0) {
+          console.log('Sending to Gemini for analysis...');
+          const prompt = "You are a data extractor. Analyze the input and return ONLY a valid JSON object with keys: 'summary' (string), 'intent' (string), and 'details' (object). Do not use Markdown formatting.";
 
-        try {
           const result = await model.generateContent([prompt, ...geminiInputParts]);
           const response = await result.response;
           const text = response.text();
@@ -129,23 +156,21 @@ app.post('/webhook', async (req, res) => {
             analysisJson = { error: "Failed to parse JSON", raw: text };
           }
 
-          // TEST MODE: Log to console instead of Database
           console.log('---------------------------------------------------');
           console.log('ANALYSIS RESULT:', JSON.stringify(analysisJson, null, 2));
           console.log('---------------------------------------------------');
-
-        } catch (geminiError) {
-          console.error("Gemini Error:", geminiError.message);
         }
       }
-      res.sendStatus(200);
-    } else {
-      res.sendStatus(404);
     }
   } catch (error) {
-    console.error('Error processing webhook:', error.message);
-    if (error.response) console.error('Error Details:', error.response.data);
-    res.sendStatus(500);
+    // Catch ALL errors to prevent server crash
+    console.error('CRITICAL ERROR in Webhook Handler:', error);
+    if (error.response) console.error('Error Response Data:', JSON.stringify(error.response.data, null, 2));
+  } finally {
+    // ALWAYS return 200 OK to Meta
+    if (!res.headersSent) {
+      res.sendStatus(200);
+    }
   }
 });
 
