@@ -1,172 +1,202 @@
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
+const { Telegraf, Markup } = require('telegraf');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { Telegraf } = require('telegraf');
+const { Pool } = require('pg');
+const axios = require('axios');
+const express = require('express');
+require('dotenv').config();
 
+// --- CONFIGURATION ---
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-const {
-  PORT,
-  GEMINI_API_KEY,
-  TELEGRAM_BOT_TOKEN
-} = process.env;
+// 1. Database Connection
+const pool = new Pool({
+  user: 'postgres.gzdrfihkqjdffojuwcmm',
+  host: 'aws-1-ap-southeast-1.pooler.supabase.com',
+  database: 'postgres',
+  password: '202510',
+  port: 5432,
+  ssl: { rejectUnauthorized: false }
+});
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-// Using gemini-1.5-flash as requested
-const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+// 2. AI & Bot Setup
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-// Initialize Telegram Bot
-if (!TELEGRAM_BOT_TOKEN) {
-  console.error('CRITICAL: TELEGRAM_BOT_TOKEN is missing in .env');
-  process.exit(1);
-}
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+// 3. Session Store (In-Memory)
+const userSessions = {};
 
-// --- GEMINI HELPER FUNCTION ---
-async function analyzeWithGemini(inputParts) {
-  const prompt = "You are a data extractor. Analyze the input and return ONLY a valid JSON object with keys: 'summary' (string), 'intent' (string), and 'details' (object). Do not use Markdown formatting.";
-  const result = await model.generateContent([prompt, ...inputParts]);
-  const response = await result.response;
-  return response.text();
-}
+// --- MIDDLEWARE: AUTHENTICATION GATE ---
+bot.use(async (ctx, next) => {
+  // Skip for start command or if we are handling a contact message
+  if (ctx.message && (ctx.message.text === '/start' || ctx.message.contact)) {
+    return next();
+  }
 
-// --- TELEGRAM HANDLERS ---
+  const chatId = ctx.chat.id;
+
+  // Check if user is logged in
+  if (userSessions[chatId]) {
+    return next();
+  }
+
+  // Not logged in: Request Contact
+  await ctx.reply(
+    "Welcome to the Carbon Tracker! 🌱\nTo link your profile, please tap the 'Share Contact' button below.",
+    Markup.keyboard([
+      Markup.button.contactRequest('📱 Share Contact')
+    ]).oneTime().resize()
+  );
+});
+
+// --- HANDLERS ---
 
 // 1. Start Command
-bot.start((ctx) => ctx.reply('Hello! I am your AI Assistant. Send me text, photos, or audio, and I will analyze them with Gemini 🤖.'));
+bot.start((ctx) => {
+  ctx.reply("Welcome! Please share your contact to log in.");
+});
 
-// 2. Text Handler
-bot.on('text', async (ctx) => {
+// 2. Contact Handler (Login)
+bot.on('contact', async (ctx) => {
+  const contact = ctx.message.contact;
+  let phoneNumber = contact.phone_number;
+
+  // Normalize phone number (ensure it has '+' if missing, though standardizing depends on DB)
+  // Telegram might send '919876543210' or '+919876543210'.
+  // We will try to match loosely or assume DB has one format. 
+  // For now, let's try to pass it as is or handle basic variations in SQL if needed.
+  // Assuming DB stores with '+' or we query both.
+
+  // Quick fix: Add '+' if missing for the query
+  if (!phoneNumber.startsWith('+')) {
+    phoneNumber = '+' + phoneNumber;
+  }
+
   try {
-    const text = ctx.message.text;
-    console.log('Received Text:', text);
-    await ctx.reply('Analyzing text...');
+    const res = await pool.query(
+      'SELECT id, first_name FROM api_profile WHERE phone_no = $1 OR phone_no = $2',
+      [phoneNumber, contact.phone_number] // Try both formats
+    );
 
-    // Gemini Analysis
-    const analysis = await analyzeWithGemini([text]);
+    console.log('Login attempt:', phoneNumber, 'Found:', res.rows.length);
 
-    // Reply with formatted JSON or raw text
-    const senderInfo = `
-----------------
-👤 Verified Sender
-🆔 ID: ${ctx.from.id}
-wm Name: ${ctx.from.first_name}`;
-    await ctx.reply(`📊 Analysis Result:\n\n${analysis}\n${senderInfo}`);
-
-  } catch (error) {
-    console.error('Error handling text:', error);
-    await ctx.reply('⚠️ I had trouble analyzing that text.');
+    if (res.rows.length > 0) {
+      const user = res.rows[0];
+      userSessions[ctx.chat.id] = user.id; // Save User ID to session
+      await ctx.reply(
+        `Verified! ✅ Welcome back, ${user.first_name}.\nYou can now send me photos of waste, bills, or food to log them.`,
+        Markup.removeKeyboard()
+      );
+      console.log(`User Logged In: ${user.id} (${phoneNumber})`);
+    } else {
+      await ctx.reply(
+        "❌ Phone number not found in our records. Please register on the website first.",
+        Markup.removeKeyboard()
+      );
+    }
+  } catch (err) {
+    console.error('DB Error on Login:', err);
+    ctx.reply("⚠️ Application Error. Please try again later.");
   }
 });
 
-// 3. Photo Handler
-bot.on('photo', async (ctx) => {
+// 3. Message Handler (Text & Photo)
+bot.on(['text', 'photo'], async (ctx) => {
+  // Only proceed if we have a user_id (Middleware should catch this, but safe check)
+  const userId = userSessions[ctx.chat.id];
+  if (!userId) return;
+
   try {
-    console.log('Received Photo');
-    await ctx.reply('Downloading and analyzing photo...');
+    let geminiInput = [];
 
-    // Get highest quality photo
-    const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-    const fileLink = await bot.telegram.getFileLink(fileId);
+    // HANDLE TEXT
+    if (ctx.message.text) {
+      geminiInput.push(ctx.message.text);
+      await ctx.reply("Thinking... 💭");
+    }
 
-    // Download Image
-    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
-    const base64Data = Buffer.from(response.data).toString('base64');
-    const mimeType = 'image/jpeg'; // Telegram photos are usually JPEGs
+    // HANDLE PHOTO
+    if (ctx.message.photo) {
+      await ctx.reply("Analyzing photo... 📸");
+      const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+      const fileLink = await bot.telegram.getFileLink(fileId);
 
-    // Gemini Analysis
-    const analysis = await analyzeWithGemini([{
-      inlineData: {
-        data: base64Data,
-        mimeType: mimeType
+      const imageResp = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+
+      geminiInput.push({
+        inlineData: {
+          data: Buffer.from(imageResp.data).toString('base64'),
+          mimeType: 'image/jpeg',
+        },
+      });
+      // Add a prompt context if it's just a photo, or if there's caption
+      if (ctx.message.caption) {
+        geminiInput.push(ctx.message.caption);
       }
-    }]);
+    }
 
-    const senderInfo = `
-----------------
-👤 Verified Sender
-🆔 ID: ${ctx.from.id}
-wm Name: ${ctx.from.first_name}`;
-    await ctx.reply(`📊 Photo Analysis Result:\n\n${analysis}\n${senderInfo}`);
+    // SYSTEM INSTRUCTION
+    const systemInstruction = `
+You are a Carbon Footprint Tracker AI. Your goal is to extract structured data from the user's input for the database.
+**Rules:**
+1. **Category:** MUST be strictly one of: 'waste', 'consumption', 'food', 'energy', 'transport'.
+2. **Carbon Footprint:** Estimate the kg CO2e (Carbon Footprint) based on the item and quantity.
+3. **Output:** Return ONLY a raw JSON object (no markdown) with this structure:
+{
+  "category": "string",
+  "description": "string",
+  "value": number,
+  "unit": "string",
+  "carbon_footprint_kg": number,
+  "reply_to_user": "A friendly, encouraging message with emojis confirming what was logged."
+}`;
+
+    // CALL GEMINI
+    const result = await model.generateContent([systemInstruction, ...geminiInput]);
+    const responseText = result.response.text();
+
+    // CLEAN JSON
+    const jsonString = responseText.replace(/```json|```/g, '').trim();
+    const data = JSON.parse(jsonString);
+
+    // INSERT INTO DB
+    const insertQuery = `
+            INSERT INTO api_activity (user_id, category, description, value, unit, carbon_footprint_kg, source, timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        `;
+
+    await pool.query(insertQuery, [
+      userId,
+      data.category,
+      data.description,
+      data.value,
+      data.unit,
+      data.carbon_footprint_kg,
+      'chatbot_pending'
+    ]);
+
+    // REPLY TO USER
+    await ctx.reply(`${data.reply_to_user}\n\n✅ Successfully logged to database!`);
 
   } catch (error) {
-    console.error('Error handling photo:', error);
-    await ctx.reply('⚠️ I had trouble analyzing that photo.');
+    console.error('Error processing message:', error);
+    await ctx.reply("⚠️ Error: Could not verify or save your activity. Please try again.");
   }
 });
 
-// 4. Audio/Voice Handler
-bot.on(['voice', 'audio'], async (ctx) => {
-  try {
-    console.log('Received Audio/Voice');
-    await ctx.reply('Listening and analyzing audio...');
-
-    const fileId = ctx.message.voice ? ctx.message.voice.file_id : ctx.message.audio.file_id;
-    const fileLink = await bot.telegram.getFileLink(fileId);
-
-    // Determine Mime Type (guess based on type, handle generic)
-    // Telegram voice notes are usually .oga (OGG Opus)
-    // Audio files can be mp3, etc. We'll rely on Gemini to handle common formats or default to generic.
-    // Ideally we inspect response headers or file extension from url.
-    const extension = fileLink.pathname.split('.').pop();
-    let mimeType = 'audio/ogg'; // Default for voice
-    if (extension === 'mp3') mimeType = 'audio/mp3';
-    if (extension === 'wav') mimeType = 'audio/wav';
-
-    // Download Audio
-    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
-    const base64Data = Buffer.from(response.data).toString('base64');
-
-    // Gemini Analysis
-    const analysis = await analyzeWithGemini([{
-      inlineData: {
-        data: base64Data,
-        mimeType: mimeType
-      }
-    }]);
-
-    const senderInfo = `
-----------------
-👤 Verified Sender
-🆔 ID: ${ctx.from.id}
-wm Name: ${ctx.from.first_name}`;
-    await ctx.reply(`📊 Audio Analysis Result:\n\n${analysis}\n${senderInfo}`);
-
-  } catch (error) {
-    console.error('Error handling audio:', error);
-    await ctx.reply('⚠️ I had trouble analyzing that audio.');
-  }
-});
-
-// --- SERVER SETUP ---
-
-// Use webhookCallback to attach Telegraf to Express
-// Hook path is arbitrary, but must match what we set with Telegram API
-const params = {
-  // If we are running locally with webhook, we use the path
-  // If not, Telegraf can also poll, but request asked for Webhook Route.
-};
-
-// Route: Telegram Webhook
-// We verify secret token if needed, but Telegraf handles basic logic.
+// --- SERVER & WEBHOOK ---
+// Handle Telegram Webhook
 app.use(bot.webhookCallback('/telegram-webhook'));
 
-// Route: Health Check
-app.get('/', (req, res) => {
-  res.send('Telegram Bot is Running 🚀');
-});
+// Health Check
+app.get('/', (req, res) => res.send('Carbon Tracker Bot Active 🌍'));
 
-// --- VERCEL EXPORT ---
-// Vercel serverless function requires exporting the app
-module.exports = app;
-
-// Start Server locally if not in Vercel environment (or simply allow direct execution)
+// Start Server
 if (require.main === module) {
-  const port = PORT || 3000;
-  app.listen(port, () => {
-    console.log(`Server is listening on port ${port}`);
-    console.log('Make sure to set your Telegram Webhook to: <YOUR_URL>/telegram-webhook');
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
   });
 }
+
+module.exports = app;
