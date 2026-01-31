@@ -21,7 +21,7 @@ const pool = new Pool({
 
 // 2. AI & Bot Setup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // 3. Session Store (In-Memory)
@@ -29,81 +29,54 @@ const userSessions = {};
 
 // --- MIDDLEWARE: AUTHENTICATION GATE ---
 bot.use(async (ctx, next) => {
-  // Skip for start command or if we are handling a contact message
-  if (ctx.message && (ctx.message.text === '/start' || ctx.message.contact)) {
-    return next();
-  }
+  // Ignore updates that don't have a message or sender (e.g. edits, system messages if needed)
+  if (!ctx.message || !ctx.from) return next();
 
   const chatId = ctx.chat.id;
+  const firstName = ctx.from.first_name;
 
-  // Check if user is logged in
+  // 1. Check if already logged in
   if (userSessions[chatId]) {
     return next();
   }
 
-  // Not logged in: Request Contact
-  await ctx.reply(
-    "Welcome to the Carbon Tracker! 🌱\nTo link your profile, please tap the 'Share Contact' button below.",
-    Markup.keyboard([
-      Markup.button.contactRequest('📱 Share Contact')
-    ]).oneTime().resize()
-  );
+  // 2. Try Auto-Login by First Name
+  try {
+    console.log(`Attempting login for: ${firstName}`);
+    const res = await pool.query(
+      'SELECT id, first_name FROM api_profile WHERE first_name = $1',
+      [firstName]
+    );
+
+    if (res.rows.length > 0) {
+      const user = res.rows[0];
+      userSessions[chatId] = user.id; // Save User ID to session
+      await ctx.reply(`👋 Welcome back, ${user.first_name}! You are verified.`);
+      console.log(`User Logged In: ${user.id} (${firstName})`);
+      return next();
+    } else {
+      console.log(`Login failed for: ${firstName}`);
+      await ctx.reply(`❌ Access Denied. Your Telegram name "${firstName}" was not found in our records.`);
+      // Do NOT call next(), execution stops here for unverified users.
+    }
+  } catch (err) {
+    console.error('DB Error on Auto-Login:', err);
+    await ctx.reply("⚠️ Service Error. Please try again later.");
+  }
 });
 
 // --- HANDLERS ---
 
 // 1. Start Command
 bot.start((ctx) => {
-  ctx.reply("Welcome! Please share your contact to log in.");
+  // Middleware handles the greeting/login logic now, but we can have a specific start message if needed.
+  // If execution reached here, user is logged in.
+  ctx.reply("I am ready to track your carbon footprint! 🌿\nSend me text or photos.");
 });
 
-// 2. Contact Handler (Login)
-bot.on('contact', async (ctx) => {
-  const contact = ctx.message.contact;
-  let phoneNumber = contact.phone_number;
-
-  // Normalize phone number (ensure it has '+' if missing, though standardizing depends on DB)
-  // Telegram might send '919876543210' or '+919876543210'.
-  // We will try to match loosely or assume DB has one format. 
-  // For now, let's try to pass it as is or handle basic variations in SQL if needed.
-  // Assuming DB stores with '+' or we query both.
-
-  // Quick fix: Add '+' if missing for the query
-  if (!phoneNumber.startsWith('+')) {
-    phoneNumber = '+' + phoneNumber;
-  }
-
-  try {
-    const res = await pool.query(
-      'SELECT id, first_name FROM api_profile WHERE phone_no = $1 OR phone_no = $2',
-      [phoneNumber, contact.phone_number] // Try both formats
-    );
-
-    console.log('Login attempt:', phoneNumber, 'Found:', res.rows.length);
-
-    if (res.rows.length > 0) {
-      const user = res.rows[0];
-      userSessions[ctx.chat.id] = user.id; // Save User ID to session
-      await ctx.reply(
-        `Verified! ✅ Welcome back, ${user.first_name}.\nYou can now send me photos of waste, bills, or food to log them.`,
-        Markup.removeKeyboard()
-      );
-      console.log(`User Logged In: ${user.id} (${phoneNumber})`);
-    } else {
-      await ctx.reply(
-        "❌ Phone number not found in our records. Please register on the website first.",
-        Markup.removeKeyboard()
-      );
-    }
-  } catch (err) {
-    console.error('DB Error on Login:', err);
-    ctx.reply("⚠️ Application Error. Please try again later.");
-  }
-});
-
-// 3. Message Handler (Text & Photo)
+// 2. Message Handler (Text & Photo)
 bot.on(['text', 'photo'], async (ctx) => {
-  // Only proceed if we have a user_id (Middleware should catch this, but safe check)
+  // Extra safety, though middleware should block
   const userId = userSessions[ctx.chat.id];
   if (!userId) return;
 
